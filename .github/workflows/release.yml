@@ -1,0 +1,177 @@
+name: Build and release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  NDK_VERSION: '27.2.12479018'
+  ANDROID_API: '23'
+  RUST_TOOLCHAIN: 'nightly-2026-09-01'
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Checkout KernelSU profile helper
+        uses: actions/checkout@v6
+        with:
+          repository: j-hc/ksu_profile
+          # Omit ref to follow the upstream repository's default branch.
+          path: build/ksu_profile
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Check module version
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          version=$(sed -n 's/^version=//p' module/module.prop)
+          version_code=$(sed -n 's/^versionCode=//p' module/module.prop)
+          [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$version_code" =~ ^[0-9]+$ ]]
+          if [[ "$REF_TYPE" == tag && "$REF_NAME" != "$version" ]]; then
+            echo "::error::Tag $REF_NAME does not match module/module.prop version $version"
+            exit 1
+          fi
+          echo "MODULE_VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Install Android NDK
+        run: |
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;$NDK_VERSION"
+          echo "NDK_BIN=$ANDROID_HOME/ndk/$NDK_VERSION/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_ENV"
+
+      - name: Install Rust targets
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal \
+            --target aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+
+      - name: Prepare module
+        run: |
+          mkdir -p build/module dist
+          cp -a module/. build/module/
+          # Use this repository's release feed, including when building a fork.
+          sed -i "s|^updateJson=.*|updateJson=https://github.com/$GITHUB_REPOSITORY/releases/latest/download/update.json|" build/module/module.prop
+
+      - name: Build KernelSU WebUI
+        working-directory: ksu-webui
+        run: |
+          npm install --no-audit --no-fund
+          npx --no-install parcel build src/index.html \
+            --dist-dir ../build/module/webroot --public-url ./
+
+      - name: Build native libraries and CLI
+        run: |
+          while read -r abi arch rust_target clang_target; do
+            mkdir -p "build/module/zygisk" "build/module/bin/$arch"
+            "$NDK_BIN/${clang_target}${ANDROID_API}-clang++" \
+              -std=c++17 -O2 -fPIC -shared -fvisibility=hidden \
+              -static-libstdc++ -Wl,-z,defs -Wl,-z,max-page-size=16384 \
+              zygisk/jni/module.cpp zygisk/jni/binder.cpp -llog \
+              -o "build/module/zygisk/$abi.so"
+            "$NDK_BIN/llvm-strip" "build/module/zygisk/$abi.so"
+
+            linker_var="CARGO_TARGET_${rust_target^^}_LINKER"
+            linker_var="${linker_var//-/_}"
+            env "$linker_var=$NDK_BIN/${clang_target}${ANDROID_API}-clang" \
+              RUSTFLAGS='-C link-arg=-Wl,-z,max-page-size=16384' \
+              cargo +"$RUST_TOOLCHAIN" build --manifest-path cli/Cargo.toml \
+                --target "$rust_target" --profile release-pr
+            install -m 755 "cli/target/$rust_target/release-pr/cli" \
+              "build/module/bin/$arch/detach"
+
+            "$NDK_BIN/${clang_target}${ANDROID_API}-clang" \
+              -std=gnu11 -O2 -fPIE -pie -Wl,-z,max-page-size=16384 \
+              build/ksu_profile/jni/ksu_profile.c \
+              -o "build/module/bin/$arch/ksu_profile"
+            "$NDK_BIN/llvm-strip" "build/module/bin/$arch/ksu_profile"
+
+            "$NDK_BIN/llvm-readelf" --dyn-syms "build/module/zygisk/$abi.so" \
+              > "build/$abi-symbols.txt"
+            grep -q 'zygisk_module_entry' "build/$abi-symbols.txt"
+            grep -q 'zygisk_companion_entry' "build/$abi-symbols.txt"
+          done <<'TARGETS'
+          arm64-v8a arm64 aarch64-linux-android aarch64-linux-android
+          armeabi-v7a arm armv7-linux-androideabi armv7a-linux-androideabi
+          x86 x86 i686-linux-android i686-linux-android
+          x86_64 x64 x86_64-linux-android x86_64-linux-android
+          TARGETS
+
+      - name: Package release
+        run: |
+          archive="zygisk-detach-$MODULE_VERSION.zip"
+          cp LICENSE build/module/LICENSE
+          (cd build/module && zip -qr "../../dist/$archive" .)
+          unzip -t "dist/$archive"
+          (cd dist && sha256sum "$archive" > SHA256SUMS)
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          props = dict(line.split('=', 1) for line in
+                       Path('build/module/module.prop').read_text().splitlines() if '=' in line)
+          base = f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/releases"
+          version = props['version']
+          Path('dist/update.json').write_text(json.dumps({
+              'version': version,
+              'versionCode': int(props['versionCode']),
+              'zipUrl': f'{base}/download/{version}/zygisk-detach-{version}.zip',
+              'changelog': f'{base}/download/{version}/changelog.md',
+          }, indent=2) + '\n')
+          PY
+          printf '# zygisk-detach %s\n\nMagisk / KernelSU build: ARM, ARM64, x86, x86_64. Includes KernelSU WebUI and ksu_profile.\n\nZygisk must be enabled (install a Zygisk implementation on KernelSU).\n\nSource: https://github.com/%s/commit/%s\n' \
+            "$MODULE_VERSION" "$GITHUB_REPOSITORY" "$GITHUB_SHA" > dist/changelog.md
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: zygisk-detach-release
+          path: dist/
+          if-no-files-found: error
+          compression-level: 0
+
+  publish:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: zygisk-detach-release
+          path: dist
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$RELEASE_TAG" dist/* \
+            --verify-tag --title "zygisk-detach $RELEASE_TAG" \
+            --notes-file dist/changelog.md
